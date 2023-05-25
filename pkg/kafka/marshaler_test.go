@@ -21,7 +21,7 @@ func TestDefaultMarshaler_MarshalUnmarshal(t *testing.T) {
 	marshaled, err := m.Marshal("topic", msg)
 	require.NoError(t, err)
 
-	unmarshaledMsg, err := m.Unmarshal(producerToConsumerMessage(marshaled))
+	unmarshaledMsg, err := m.Unmarshal(marshaled)
 	require.NoError(t, err)
 
 	assert.True(t, msg.Equals(unmarshaledMsg))
@@ -49,10 +49,8 @@ func BenchmarkDefaultMarshaler_Unmarshal(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	consumedMsg := producerToConsumerMessage(marshaled)
-
 	for i := 0; i < b.N; i++ {
-		_, _ = m.Unmarshal(consumedMsg)
+		_, _ = m.Unmarshal(marshaled)
 	}
 }
 
@@ -68,14 +66,14 @@ func TestWithPartitioningMarshaler_MarshalUnmarshal(t *testing.T) {
 	producerMsg, err := m.Marshal("topic", msg)
 	require.NoError(t, err)
 
-	unmarshaledMsg, err := m.Unmarshal(producerToConsumerMessage(producerMsg))
+	unmarshaledMsg, err := m.Unmarshal(producerMsg)
 	require.NoError(t, err)
 
 	assert.True(t, msg.Equals(unmarshaledMsg))
 
 	assert.NoError(t, err)
 
-	producerKey, err := producerMsg.Key.Encode()
+	producerKey := producerMsg.Key
 	require.NoError(t, err)
 
 	assert.Equal(t, string(producerKey), partitionKey)

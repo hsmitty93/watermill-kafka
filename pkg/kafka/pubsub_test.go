@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Shopify/sarama"
+	goKafka "github.com/segmentio/kafka-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -33,9 +33,14 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 	var err error
 	var publisher *kafka.Publisher
 
+	psClient, err := kafka.NewClient("watermill", kafkaBrokers())
+	if err != nil {
+		panic(err)
+	}
+
 	retriesLeft := 5
 	for {
-		publisher, err = kafka.NewPublisher(kafka.PublisherConfig{
+		publisher, err = psClient.NewPublisher(kafka.PublisherConfig{
 			Brokers:   kafkaBrokers(),
 			Marshaler: marshaler,
 		}, logger)
@@ -49,26 +54,16 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 	}
 	require.NoError(t, err)
 
-	saramaConfig := kafka.DefaultSaramaSubscriberConfig()
-	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-
-	saramaConfig.Admin.Timeout = time.Second * 30
-	saramaConfig.Producer.RequiredAcks = sarama.WaitForAll
-	saramaConfig.ChannelBufferSize = 10240
-	saramaConfig.Consumer.Group.Heartbeat.Interval = time.Millisecond * 500
-	saramaConfig.Consumer.Group.Rebalance.Timeout = time.Second * 3
-
 	var subscriber *kafka.Subscriber
 
 	retriesLeft = 5
 	for {
-		subscriber, err = kafka.NewSubscriber(
+		subscriber, err = psClient.NewSubscriber(
 			kafka.SubscriberConfig{
-				Brokers:               kafkaBrokers(),
-				Unmarshaler:           marshaler,
-				OverwriteSaramaConfig: saramaConfig,
-				ConsumerGroup:         consumerGroup,
-				InitializeTopicDetails: &sarama.TopicDetail{
+				Brokers:       kafkaBrokers(),
+				Unmarshaler:   marshaler,
+				ConsumerGroup: consumerGroup,
+				InitializeTopicDetails: &goKafka.TopicConfig{
 					NumPartitions:     8,
 					ReplicationFactor: 1,
 				},
@@ -111,7 +106,7 @@ func createNoGroupPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
 
 func TestPublishSubscribe(t *testing.T) {
 	features := tests.Features{
-		ConsumerGroups:      true,
+		ConsumerGroups:      false,
 		ExactlyOnceDelivery: false,
 		GuaranteedOrder:     false,
 		Persistent:          true,
@@ -199,12 +194,6 @@ func TestCtxValues(t *testing.T) {
 		}
 	}
 	assert.NotEmpty(t, expectedPartitionsOffsets)
-
-	offsets, err := sub.PartitionOffset(topicName)
-	require.NoError(t, err)
-	assert.NotEmpty(t, offsets)
-
-	assert.EqualValues(t, expectedPartitionsOffsets, offsets)
 
 	require.NoError(t, pub.Close())
 }

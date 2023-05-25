@@ -2,14 +2,15 @@ package kafka
 
 import (
 	"context"
-	"strings"
+	"io"
+	"net"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/Shopify/sarama"
-	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
+	"github.com/segmentio/kafka-go"
+	ktrace "gopkg.in/DataDog/dd-trace-go.v1/contrib/segmentio/kafka.go.v0"
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
@@ -21,12 +22,13 @@ type Subscriber struct {
 
 	closing       chan struct{}
 	subscribersWg sync.WaitGroup
+	dialer        *kafka.Dialer
 
 	closed bool
 }
 
 // NewSubscriber creates a new Kafka Subscriber.
-func NewSubscriber(
+func (c *KafkaClient) NewSubscriber(
 	config SubscriberConfig,
 	logger watermill.LoggerAdapter,
 ) (*Subscriber, error) {
@@ -47,6 +49,7 @@ func NewSubscriber(
 	return &Subscriber{
 		config: config,
 		logger: logger,
+		dialer: c.credentials.Dialer(),
 
 		closing: make(chan struct{}),
 	}, nil
@@ -59,9 +62,6 @@ type SubscriberConfig struct {
 	// Unmarshaler is used to unmarshal messages from Kafka format into Watermill format.
 	Unmarshaler Unmarshaler
 
-	// OverwriteSaramaConfig holds additional sarama settings.
-	OverwriteSaramaConfig *sarama.Config
-
 	// Kafka consumer group.
 	// When empty, all messages from all partitions will be returned.
 	ConsumerGroup string
@@ -72,19 +72,13 @@ type SubscriberConfig struct {
 	// How long about unsuccessful reconnecting next reconnect will occur.
 	ReconnectRetrySleep time.Duration
 
-	InitializeTopicDetails *sarama.TopicDetail
-
-	// If true then each consumed message will be wrapped with Opentelemetry tracing, provided by otelsarama.
-	OTELEnabled bool
+	InitializeTopicDetails *kafka.TopicConfig
 }
 
 // NoSleep can be set to SubscriberConfig.NackResendSleep and SubscriberConfig.ReconnectRetrySleep.
 const NoSleep time.Duration = -1
 
 func (c *SubscriberConfig) setDefaults() {
-	if c.OverwriteSaramaConfig == nil {
-		c.OverwriteSaramaConfig = DefaultSaramaSubscriberConfig()
-	}
 	if c.NackResendSleep == 0 {
 		c.NackResendSleep = time.Millisecond * 100
 	}
@@ -104,26 +98,6 @@ func (c SubscriberConfig) Validate() error {
 	return nil
 }
 
-// DefaultSaramaSubscriberConfig creates default Sarama config used by Watermill.
-//
-// Custom config can be passed to NewSubscriber and NewPublisher.
-//
-//	saramaConfig := DefaultSaramaSubscriberConfig()
-//	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-//
-//	subscriberConfig.OverwriteSaramaConfig = saramaConfig
-//
-//	subscriber, err := NewSubscriber(subscriberConfig, logger)
-//	// ...
-func DefaultSaramaSubscriberConfig() *sarama.Config {
-	config := sarama.NewConfig()
-	config.Version = sarama.V1_0_0_0
-	config.Consumer.Return.Errors = true
-	config.ClientID = "watermill"
-
-	return config
-}
-
 // Subscribe subscribers for messages in Kafka.
 //
 // There are multiple subscribers spawned
@@ -133,6 +107,16 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	}
 
 	s.subscribersWg.Add(1)
+
+	kafkaReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: s.config.Brokers,
+		Dialer:  s.dialer,
+		Topic:   topic,
+	})
+
+	tracedReader := ktrace.WrapReader(kafkaReader,
+		ktrace.WithServiceName("watermill-kafka"),
+		ktrace.WithAnalytics(true))
 
 	logFields := watermill.LogFields{
 		"provider":            "kafka",
@@ -145,15 +129,11 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	// we don't want to have buffered channel to not consume message from Kafka when consumer is not consuming
 	output := make(chan *message.Message)
 
-	consumeClosed, err := s.consumeMessages(ctx, topic, output, logFields)
-	if err != nil {
-		s.subscribersWg.Done()
-		return nil, err
-	}
+	s.consumeMessages(ctx, tracedReader, topic, output, logFields)
 
 	go func() {
 		// blocking, until s.closing is closed
-		s.handleReconnects(ctx, topic, output, consumeClosed, logFields)
+		s.handleReconnects(ctx, tracedReader, topic, output, logFields)
 		close(output)
 		s.subscribersWg.Done()
 	}()
@@ -163,20 +143,12 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 
 func (s *Subscriber) handleReconnects(
 	ctx context.Context,
+	reader *ktrace.Reader,
 	topic string,
 	output chan *message.Message,
-	consumeClosed chan struct{},
 	logFields watermill.LogFields,
 ) {
 	for {
-		// nil channel will cause deadlock
-		if consumeClosed != nil {
-			<-consumeClosed
-			s.logger.Debug("consumeMessages stopped", logFields)
-		} else {
-			s.logger.Debug("empty consumeClosed", logFields)
-		}
-
 		select {
 		// it's important to don't exit before consumeClosed,
 		// to not trigger s.subscribersWg.Done() before consumer is closed
@@ -191,33 +163,18 @@ func (s *Subscriber) handleReconnects(
 		}
 
 		s.logger.Info("Reconnecting consumer", logFields)
-
-		var err error
-		consumeClosed, err = s.consumeMessages(ctx, topic, output, logFields)
-		if err != nil {
-			s.logger.Error("Cannot reconnect messages consumer", err, logFields)
-
-			if s.config.ReconnectRetrySleep != NoSleep {
-				time.Sleep(s.config.ReconnectRetrySleep)
-			}
-			continue
-		}
+		s.consumeMessages(ctx, reader, topic, output, logFields)
 	}
 }
 
 func (s *Subscriber) consumeMessages(
 	ctx context.Context,
+	reader *ktrace.Reader,
 	topic string,
 	output chan *message.Message,
 	logFields watermill.LogFields,
-) (consumeMessagesClosed chan struct{}, err error) {
+) {
 	s.logger.Info("Starting consuming", logFields)
-
-	// Start with a client
-	client, err := sarama.NewClient(s.config.Brokers, s.config.OverwriteSaramaConfig)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create new Sarama client")
-	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -230,228 +187,7 @@ func (s *Subscriber) consumeMessages(
 		}
 	}()
 
-	if s.config.ConsumerGroup == "" {
-		consumeMessagesClosed, err = s.consumeWithoutConsumerGroups(ctx, client, topic, output, logFields, s.config.OTELEnabled)
-	} else {
-		consumeMessagesClosed, err = s.consumeGroupMessages(ctx, client, topic, output, logFields, s.config.OTELEnabled)
-	}
-	if err != nil {
-		s.logger.Debug(
-			"Starting consume failed, cancelling context",
-			logFields.Add(watermill.LogFields{"err": err}),
-		)
-		cancel()
-		return nil, err
-	}
-
-	go func() {
-		<-consumeMessagesClosed
-		if err := client.Close(); err != nil {
-			s.logger.Error("Cannot close client", err, logFields)
-		} else {
-			s.logger.Debug("Client closed", logFields)
-		}
-	}()
-
-	return consumeMessagesClosed, nil
-}
-
-func (s *Subscriber) consumeGroupMessages(
-	ctx context.Context,
-	client sarama.Client,
-	topic string,
-	output chan *message.Message,
-	logFields watermill.LogFields,
-	otelEnabled bool,
-) (chan struct{}, error) {
-	// Start a new consumer group
-	group, err := sarama.NewConsumerGroupFromClient(s.config.ConsumerGroup, client)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create consumer group client")
-	}
-
-	groupClosed := make(chan struct{})
-
-	handleGroupErrorsCtx, cancelHandleGroupErrors := context.WithCancel(context.Background())
-	handleGroupErrorsDone := s.handleGroupErrors(handleGroupErrorsCtx, group, logFields)
-
-	var handler sarama.ConsumerGroupHandler = consumerGroupHandler{
-		ctx:              ctx,
-		messageHandler:   s.createMessagesHandler(output),
-		logger:           s.logger,
-		closing:          s.closing,
-		messageLogFields: logFields,
-	}
-
-	if otelEnabled {
-		handler = otelsarama.WrapConsumerGroupHandler(handler)
-	}
-
-	go func() {
-		defer func() {
-			cancelHandleGroupErrors()
-			<-handleGroupErrorsDone
-
-			if err := group.Close(); err != nil {
-				s.logger.Info("Group close with error", logFields.Add(watermill.LogFields{"err": err.Error()}))
-			}
-
-			s.logger.Info("Consuming done", logFields)
-			close(groupClosed)
-		}()
-
-	ConsumeLoop:
-		for {
-			select {
-			default:
-				s.logger.Debug("Not closing", logFields)
-			case <-s.closing:
-				s.logger.Debug("Subscriber is closing, stopping group.Consume loop", logFields)
-				break ConsumeLoop
-			case <-ctx.Done():
-				s.logger.Debug("Ctx was cancelled, stopping group.Consume loop", logFields)
-				break ConsumeLoop
-			}
-
-			if err := group.Consume(ctx, []string{topic}, handler); err != nil {
-				if err == sarama.ErrUnknown {
-					// this is info, because it is often just noise
-					s.logger.Info("Received unknown Sarama error", logFields.Add(watermill.LogFields{"err": err.Error()}))
-				} else {
-					s.logger.Error("Group consume error", err, logFields)
-				}
-
-				break ConsumeLoop
-			}
-
-			// this is expected behaviour to run Consume again after it exited
-			// see: https://github.com/ThreeDotsLabs/watermill/issues/210
-			s.logger.Debug("Consume stopped without any error, running consume again", logFields)
-		}
-	}()
-
-	return groupClosed, nil
-}
-
-func (s *Subscriber) handleGroupErrors(
-	ctx context.Context,
-	group sarama.ConsumerGroup,
-	logFields watermill.LogFields,
-) chan struct{} {
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		errs := group.Errors()
-
-		for {
-			select {
-			case err := <-errs:
-				if err == nil {
-					continue
-				}
-
-				s.logger.Error("Sarama internal error", err, logFields)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return done
-}
-
-func (s *Subscriber) consumeWithoutConsumerGroups(
-	ctx context.Context,
-	client sarama.Client,
-	topic string,
-	output chan *message.Message,
-	logFields watermill.LogFields,
-	otelEnabled bool,
-) (chan struct{}, error) {
-	consumer, err := sarama.NewConsumerFromClient(client)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create client")
-	}
-
-	if otelEnabled {
-		consumer = otelsarama.WrapConsumer(consumer)
-	}
-
-	partitions, err := consumer.Partitions(topic)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot get partitions")
-	}
-
-	partitionConsumersWg := &sync.WaitGroup{}
-
-	for _, partition := range partitions {
-		partitionLogFields := logFields.Add(watermill.LogFields{"kafka_partition": partition})
-
-		partitionConsumer, err := consumer.ConsumePartition(topic, partition, s.config.OverwriteSaramaConfig.Consumer.Offsets.Initial)
-		if err != nil {
-			if err := client.Close(); err != nil && err != sarama.ErrClosedClient {
-				s.logger.Error("Cannot close client", err, partitionLogFields)
-			}
-			return nil, errors.Wrap(err, "failed to start consumer for partition")
-		}
-
-		if otelEnabled {
-			partitionConsumer = otelsarama.WrapPartitionConsumer(partitionConsumer)
-		}
-
-		messageHandler := s.createMessagesHandler(output)
-
-		partitionConsumersWg.Add(1)
-		go s.consumePartition(ctx, partitionConsumer, messageHandler, partitionConsumersWg, partitionLogFields)
-	}
-
-	closed := make(chan struct{})
-	go func() {
-		partitionConsumersWg.Wait()
-		close(closed)
-	}()
-
-	return closed, nil
-}
-
-func (s *Subscriber) consumePartition(
-	ctx context.Context,
-	partitionConsumer sarama.PartitionConsumer,
-	messageHandler messageHandler,
-	partitionConsumersWg *sync.WaitGroup,
-	logFields watermill.LogFields,
-) {
-	defer func() {
-		if err := partitionConsumer.Close(); err != nil {
-			s.logger.Error("Cannot close partition consumer", err, logFields)
-		}
-		partitionConsumersWg.Done()
-		s.logger.Debug("consumePartition stopped", logFields)
-
-	}()
-
-	kafkaMessages := partitionConsumer.Messages()
-
-	for {
-		select {
-		case kafkaMsg := <-kafkaMessages:
-			if kafkaMsg == nil {
-				s.logger.Debug("kafkaMsg is closed, stopping consumePartition", logFields)
-				return
-			}
-			if err := messageHandler.processMessage(ctx, kafkaMsg, nil, logFields); err != nil {
-				return
-			}
-		case <-s.closing:
-			s.logger.Debug("Subscriber is closing, stopping consumePartition", logFields)
-			return
-
-		case <-ctx.Done():
-			s.logger.Debug("Ctx was cancelled, stopping consumePartition", logFields)
-			return
-		}
-	}
+	go s.consume(ctx, reader, topic, output, logFields)
 }
 
 func (s *Subscriber) createMessagesHandler(output chan *message.Message) messageHandler {
@@ -461,6 +197,62 @@ func (s *Subscriber) createMessagesHandler(output chan *message.Message) message
 		nackResendSleep: s.config.NackResendSleep,
 		logger:          s.logger,
 		closing:         s.closing,
+	}
+}
+
+func (s *Subscriber) consume(
+	ctx context.Context,
+	reader *ktrace.Reader,
+	topic string,
+	output chan *message.Message,
+	logFields watermill.LogFields,
+) {
+	messageHandler := s.createMessagesHandler(output)
+
+	for {
+		select {
+		default:
+			s.logger.Debug("Not closing", logFields)
+		case <-s.closing:
+			s.logger.Debug("Subscriber is closing, stopping group.Consume loop", logFields)
+			return
+		case <-ctx.Done():
+			s.logger.Debug("Ctx was cancelled, stopping group.Consume loop", logFields)
+			return
+		}
+
+		kafkaMessage, err := reader.FetchMessage(ctx)
+		if errors.Is(err, context.Canceled) {
+			return
+
+		} else if err == io.EOF {
+			// end of input (broker closed connection, etc)
+			s.logger.Error("EOF received, stopping listener", err, logFields)
+			return
+
+		} else if err != nil {
+			err, ok := err.(kafka.Error)
+			if !ok {
+				// unexpected (for now), bail
+				s.logger.Error("unexpected Kafka error", err, logFields)
+				return
+			}
+
+			// https://kafka.apache.org/protocol#protocol_error_codes
+			s.logger.Error("failed to fetch message", err,
+				logFields)
+
+			reader.Close()
+
+		} else {
+			if err := messageHandler.processMessage(ctx, kafkaMessage, reader, logFields); err != nil {
+				return
+			}
+		}
+
+		// this is expected behaviour to run Consume again after it exited
+		// see: https://github.com/ThreeDotsLabs/watermill/issues/210
+		s.logger.Debug("Consume stopped without any error, running consume again", logFields)
 	}
 }
 
@@ -478,45 +270,6 @@ func (s *Subscriber) Close() error {
 	return nil
 }
 
-type consumerGroupHandler struct {
-	ctx              context.Context
-	messageHandler   messageHandler
-	logger           watermill.LoggerAdapter
-	closing          chan struct{}
-	messageLogFields watermill.LogFields
-}
-
-func (consumerGroupHandler) Setup(_ sarama.ConsumerGroupSession) error { return nil }
-
-func (consumerGroupHandler) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }
-
-func (h consumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	logFields := h.messageLogFields.Copy().Add(watermill.LogFields{
-		"kafka_partition":      claim.Partition(),
-		"kafka_initial_offset": claim.InitialOffset(),
-	})
-
-	for kafkaMsg := range claim.Messages() {
-		h.logger.Debug("Message claimed", logFields)
-		if err := h.messageHandler.processMessage(h.ctx, kafkaMsg, sess, logFields); err != nil {
-			return err
-		}
-		select {
-		case <-h.closing:
-			h.logger.Debug("Subscriber is closing, stopping consumerGroupHandler", logFields)
-			return nil
-
-		case <-h.ctx.Done():
-			h.logger.Debug("Ctx was cancelled, stopping consumerGroupHandler", logFields)
-			return nil
-		default:
-			continue
-		}
-	}
-
-	return nil
-}
-
 type messageHandler struct {
 	outputChannel chan<- *message.Message
 	unmarshaler   Unmarshaler
@@ -529,8 +282,8 @@ type messageHandler struct {
 
 func (h messageHandler) processMessage(
 	ctx context.Context,
-	kafkaMsg *sarama.ConsumerMessage,
-	sess sarama.ConsumerGroupSession,
+	kafkaMsg kafka.Message,
+	reader *ktrace.Reader,
 	messageLogFields watermill.LogFields,
 ) error {
 	receivedMsgLogFields := messageLogFields.Add(watermill.LogFields{
@@ -540,11 +293,11 @@ func (h messageHandler) processMessage(
 
 	h.logger.Trace("Received message from Kafka", receivedMsgLogFields)
 
-	ctx = setPartitionToCtx(ctx, kafkaMsg.Partition)
+	ctx = setPartitionToCtx(ctx, int32(kafkaMsg.Partition))
 	ctx = setPartitionOffsetToCtx(ctx, kafkaMsg.Offset)
-	ctx = setMessageTimestampToCtx(ctx, kafkaMsg.Timestamp)
+	ctx = setMessageTimestampToCtx(ctx, kafkaMsg.Time)
 
-	msg, err := h.unmarshaler.Unmarshal(kafkaMsg)
+	msg, err := h.unmarshaler.Unmarshal(&kafkaMsg)
 	if err != nil {
 		// resend will make no sense, stopping consumerGroupHandler
 		return errors.Wrap(err, "message unmarshal failed")
@@ -573,8 +326,8 @@ ResendLoop:
 
 		select {
 		case <-msg.Acked():
-			if sess != nil {
-				sess.MarkMessage(kafkaMsg, "")
+			if reader != nil {
+				reader.CommitMessages(ctx, kafkaMsg)
 			}
 			h.logger.Trace("Message Acked", receivedMsgLogFields)
 			break ResendLoop
@@ -600,58 +353,34 @@ ResendLoop:
 	return nil
 }
 
-func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
+func (s *Subscriber) SubscribeInitialize() (err error) {
 	if s.config.InitializeTopicDetails == nil {
 		return errors.New("s.config.InitializeTopicDetails is empty, cannot SubscribeInitialize")
 	}
 
-	clusterAdmin, err := sarama.NewClusterAdmin(s.config.Brokers, s.config.OverwriteSaramaConfig)
+	conn, err := s.dialer.Dial("tcp", s.config.Brokers[0])
 	if err != nil {
-		return errors.Wrap(err, "cannot create cluster admin")
+		return errors.Wrap(err, "cannot create connect")
 	}
-	defer func() {
-		if closeErr := clusterAdmin.Close(); closeErr != nil {
-			err = multierror.Append(err, closeErr)
-		}
-	}()
+	defer conn.Close()
 
-	if err := clusterAdmin.CreateTopic(topic, s.config.InitializeTopicDetails, false); err != nil && !strings.Contains(err.Error(), "Topic with this name already exists") {
-		return errors.Wrap(err, "cannot create topic")
+	controller, err := conn.Controller()
+	if err != nil {
+		panic(err.Error())
+	}
+	var controllerConn *kafka.Conn
+	controllerConn, err = kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	if err != nil {
+		panic(err.Error())
+	}
+	defer controllerConn.Close()
+
+	err = controllerConn.CreateTopics(*s.config.InitializeTopicDetails)
+	if err != nil {
+		panic(err.Error())
 	}
 
-	s.logger.Info("Created Kafka topic", watermill.LogFields{"topic": topic})
+	s.logger.Info("Created Kafka topic", watermill.LogFields{"topic": s.config.InitializeTopicDetails.Topic})
 
 	return nil
-}
-
-type PartitionOffset map[int32]int64
-
-func (s *Subscriber) PartitionOffset(topic string) (PartitionOffset, error) {
-	client, err := sarama.NewClient(s.config.Brokers, s.config.OverwriteSaramaConfig)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create new Sarama client")
-	}
-
-	defer func() {
-		if closeErr := client.Close(); closeErr != nil {
-			err = multierror.Append(err, closeErr)
-		}
-	}()
-
-	partitions, err := client.Partitions(topic)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot get topic partitions")
-	}
-
-	partitionOffset := make(PartitionOffset, len(partitions))
-	for _, partition := range partitions {
-		offset, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
-		if err != nil {
-			return nil, err
-		}
-
-		partitionOffset[partition] = offset
-	}
-
-	return partitionOffset, nil
 }

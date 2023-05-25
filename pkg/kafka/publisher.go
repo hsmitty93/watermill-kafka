@@ -1,31 +1,28 @@
 package kafka
 
 import (
-	"go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
-	"time"
+	"context"
 
-	"github.com/Shopify/sarama"
 	"github.com/pkg/errors"
+	"github.com/segmentio/kafka-go"
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 )
 
 type Publisher struct {
-	config   PublisherConfig
-	producer sarama.SyncProducer
-	logger   watermill.LoggerAdapter
+	config      PublisherConfig
+	credentials *KafkaCredentials
+	logger      watermill.LoggerAdapter
 
 	closed bool
 }
 
 // NewPublisher creates a new Kafka Publisher.
-func NewPublisher(
+func (c *KafkaClient) NewPublisher(
 	config PublisherConfig,
 	logger watermill.LoggerAdapter,
 ) (*Publisher, error) {
-	config.setDefaults()
-
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -34,19 +31,10 @@ func NewPublisher(
 		logger = watermill.NopLogger{}
 	}
 
-	producer, err := sarama.NewSyncProducer(config.Brokers, config.OverwriteSaramaConfig)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create Kafka producer")
-	}
-
-	if config.OTELEnabled {
-		producer = otelsarama.WrapSyncProducer(config.OverwriteSaramaConfig, producer)
-	}
-
 	return &Publisher{
-		config:   config,
-		producer: producer,
-		logger:   logger,
+		config:      config,
+		credentials: c.credentials,
+		logger:      logger,
 	}, nil
 }
 
@@ -56,18 +44,6 @@ type PublisherConfig struct {
 
 	// Marshaler is used to marshal messages from Watermill format into Kafka format.
 	Marshaler Marshaler
-
-	// OverwriteSaramaConfig holds additional sarama settings.
-	OverwriteSaramaConfig *sarama.Config
-
-	// If true then each sent message will be wrapped with Opentelemetry tracing, provided by otelsarama.
-	OTELEnabled bool
-}
-
-func (c *PublisherConfig) setDefaults() {
-	if c.OverwriteSaramaConfig == nil {
-		c.OverwriteSaramaConfig = DefaultSaramaSyncPublisherConfig()
-	}
 }
 
 func (c PublisherConfig) Validate() error {
@@ -79,18 +55,6 @@ func (c PublisherConfig) Validate() error {
 	}
 
 	return nil
-}
-
-func DefaultSaramaSyncPublisherConfig() *sarama.Config {
-	config := sarama.NewConfig()
-
-	config.Producer.Retry.Max = 10
-	config.Producer.Return.Successes = true
-	config.Version = sarama.V1_0_0_0
-	config.Metadata.Retry.Backoff = time.Second * 2
-	config.ClientID = "watermill"
-
-	return config
 }
 
 // Publish publishes message to Kafka.
@@ -105,6 +69,13 @@ func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 	logFields := make(watermill.LogFields, 4)
 	logFields["topic"] = topic
 
+	kafkaWriter := &kafka.Writer{
+		Addr:                   kafka.TCP(p.config.Brokers...),
+		AllowAutoTopicCreation: true,
+		Topic:                  topic,
+		Transport:              p.credentials.Transport(),
+	}
+
 	for _, msg := range msgs {
 		logFields["message_uuid"] = msg.UUID
 		p.logger.Trace("Sending message to Kafka", logFields)
@@ -114,13 +85,10 @@ func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 			return errors.Wrapf(err, "cannot marshal message %s", msg.UUID)
 		}
 
-		partition, offset, err := p.producer.SendMessage(kafkaMsg)
+		err = kafkaWriter.WriteMessages(context.Background(), *kafkaMsg)
 		if err != nil {
 			return errors.Wrapf(err, "cannot produce message %s", msg.UUID)
 		}
-
-		logFields["kafka_partition"] = partition
-		logFields["kafka_partition_offset"] = offset
 
 		p.logger.Trace("Message sent to Kafka", logFields)
 	}
@@ -133,10 +101,6 @@ func (p *Publisher) Close() error {
 		return nil
 	}
 	p.closed = true
-
-	if err := p.producer.Close(); err != nil {
-		return errors.Wrap(err, "cannot close Kafka producer")
-	}
 
 	return nil
 }
