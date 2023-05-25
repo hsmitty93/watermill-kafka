@@ -14,7 +14,7 @@ const (
 	timestampContextKey
 )
 
-func setPartitionToCtx(ctx context.Context, partition int32) context.Context {
+func setPartitionToCtx(ctx context.Context, partition int) context.Context {
 	return context.WithValue(ctx, partitionContextKey, partition)
 }
 
