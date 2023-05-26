@@ -35,6 +35,8 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 
 	writerConfig := &goKafka.Writer{
 		RequiredAcks: -1,
+		//BatchBytes:   369295616,
+		BatchSize: 10240,
 	}
 
 	retriesLeft := 5
@@ -55,9 +57,10 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 	require.NoError(t, err)
 
 	readerConfig := &goKafka.ReaderConfig{
-		QueueCapacity:     10240,
 		HeartbeatInterval: time.Millisecond * 500,
 		RebalanceTimeout:  time.Second * 3,
+		QueueCapacity:     10240,
+		//MaxBytes:          400000000,
 	}
 
 	var subscriber *kafka.Subscriber

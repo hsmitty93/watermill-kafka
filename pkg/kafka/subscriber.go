@@ -2,7 +2,6 @@ package kafka
 
 import (
 	"context"
-	"crypto/tls"
 	"io"
 	"sync"
 	"time"
@@ -89,15 +88,12 @@ const NoSleep time.Duration = -1
 func (c *SubscriberConfig) setDefaults() {
 	if c.Dialer == nil {
 		c.Dialer = &kafka.Dialer{
-			TLS:       &tls.Config{},
 			DualStack: true,
 		}
 	}
 
 	if c.Transport == nil {
-		c.Transport = &kafka.Transport{
-			TLS: &tls.Config{},
-		}
+		c.Transport = &kafka.Transport{}
 	}
 
 	if c.OverwriteReaderConfig == nil {

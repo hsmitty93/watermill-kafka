@@ -2,7 +2,6 @@ package kafka
 
 import (
 	"context"
-	"crypto/tls"
 
 	"github.com/pkg/errors"
 	"github.com/segmentio/kafka-go"
@@ -72,19 +71,17 @@ type PublisherConfig struct {
 
 func (c *PublisherConfig) setDefaults() {
 	if c.Transport == nil {
-		c.Transport = &kafka.Transport{
-			TLS: &tls.Config{},
-		}
+		c.Transport = &kafka.Transport{}
 	}
 	if c.OverwriteWriter == nil {
 		c.OverwriteWriter = &kafka.Writer{
 			Addr:                   kafka.TCP(c.Brokers...),
-			AllowAutoTopicCreation: false,
+			AllowAutoTopicCreation: true,
 			Transport:              c.Transport,
 		}
 	} else {
 		c.OverwriteWriter.Addr = kafka.TCP(c.Brokers...)
-		c.OverwriteWriter.AllowAutoTopicCreation = false
+		c.OverwriteWriter.AllowAutoTopicCreation = true
 		c.OverwriteWriter.Transport = c.Transport
 	}
 }
