@@ -100,12 +100,10 @@ func (c *SubscriberConfig) setDefaults() {
 		c.OverwriteReaderConfig = &kafka.ReaderConfig{
 			Brokers: c.Brokers,
 			Dialer:  c.Dialer,
-			GroupID: c.ConsumerGroup,
 		}
 	} else {
 		c.OverwriteReaderConfig.Brokers = c.Brokers
 		c.OverwriteReaderConfig.Dialer = c.Dialer
-		c.OverwriteReaderConfig.GroupID = c.ConsumerGroup
 	}
 	if c.NackResendSleep == 0 {
 		c.NackResendSleep = time.Millisecond * 100
@@ -215,12 +213,6 @@ func (s *Subscriber) consumeMessages(
 ) (consumeMessagesClosed chan struct{}, err error) {
 	s.logger.Info("Starting consuming", logFields)
 
-	// Set Readers topic
-	s.config.OverwriteReaderConfig.Topic = topic
-
-	// Start with a reader
-	reader := kafka.NewReader(*s.config.OverwriteReaderConfig)
-
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		select {
@@ -232,7 +224,11 @@ func (s *Subscriber) consumeMessages(
 		}
 	}()
 
-	consumeMessagesClosed, err = s.consumeFromReader(ctx, reader, output, logFields)
+	if s.config.ConsumerGroup == "" {
+		consumeMessagesClosed, err = s.consumeFromPartitions(ctx, topic, output, logFields)
+	} else {
+		consumeMessagesClosed, err = s.consumeGroupMessages(ctx, topic, output, logFields)
+	}
 
 	if err != nil {
 		s.logger.Debug(
@@ -243,83 +239,196 @@ func (s *Subscriber) consumeMessages(
 		return nil, err
 	}
 
-	go func() {
-		<-consumeMessagesClosed
-		if err := reader.Close(); err != nil {
-			s.logger.Error("Cannot close reader", err, logFields)
-		} else {
-			s.logger.Debug("reader closed", logFields)
-		}
-	}()
-
 	return consumeMessagesClosed, nil
 }
 
-func (s *Subscriber) consumeFromReader(ctx context.Context, reader *kafka.Reader, output chan *message.Message, logFields watermill.LogFields) (chan struct{}, error) {
+func (s *Subscriber) consumeGroupMessages(
+	ctx context.Context,
+	topic string,
+	output chan *message.Message,
+	logFields watermill.LogFields,
+) (chan struct{}, error) {
+	groupClosed := make(chan struct{})
+
+	// Set Readers topic
+	s.config.OverwriteReaderConfig.Topic = topic
+	s.config.OverwriteReaderConfig.GroupID = s.config.ConsumerGroup
+
+	// Start with a reader
+	reader := kafka.NewReader(*s.config.OverwriteReaderConfig)
+
 	messageHandler := s.createMessagesHandler(output)
 
-	readerClosed := make(chan struct{})
-
 	go func() {
+		defer func() {
+			if err := reader.Close(); err != nil {
+				s.logger.Info("Group close with error", logFields.Add(watermill.LogFields{"err": err.Error()}))
+			}
+
+			s.logger.Info("Consuming done", logFields)
+			close(groupClosed)
+		}()
+
+	ConsumeLoop:
 		for {
 			select {
 			default:
 				s.logger.Debug("Not closing", logFields)
 			case <-s.closing:
 				s.logger.Debug("Subscriber is closing, stopping group.Consume loop", logFields)
-				break
+				break ConsumeLoop
 			case <-ctx.Done():
 				s.logger.Debug("Ctx was cancelled, stopping group.Consume loop", logFields)
-				break
+				break ConsumeLoop
 			}
 
-			for {
-				kafkaMessage, err := reader.FetchMessage(ctx)
-				if errors.Is(err, context.Canceled) {
-					close(readerClosed)
+			kafkaMessage, err := reader.FetchMessage(ctx)
+			if errors.Is(err, context.Canceled) {
+
+				return
+
+			} else if err == io.EOF {
+				// end of input (broker closed connection, etc)
+				s.logger.Error("EOF received, stopping listener", err, logFields)
+
+				return
+
+			} else if err != nil {
+				kerr, ok := err.(kafka.Error)
+				if !ok {
+					// unexpected (for now), bail
+					s.logger.Error("unexpected Kafka error", err, logFields)
+
 					return
-
-				} else if err == io.EOF {
-					// end of input (broker closed connection, etc)
-					s.logger.Error("EOF received, stopping listener", err, logFields)
-					close(readerClosed)
-					return
-
-				} else if err != nil {
-					kerr, ok := err.(kafka.Error)
-					if !ok {
-						// unexpected (for now), bail
-						s.logger.Error("unexpected Kafka error", err, logFields)
-						return
-					}
-
-					logFields.Add(watermill.LogFields{
-						"kafka_error_code": int(kerr),
-						"kafka_error":      kerr.Title(),
-						"retryable":        kerr.Temporary(),
-					})
-
-					// https://kafka.apache.org/protocol#protocol_error_codes
-					s.logger.Error("failed to fetch message", kerr, logFields)
-
-					close(readerClosed)
-					return
-
-				} else {
-					if err := messageHandler.processMessage(ctx, reader, &kafkaMessage, logFields); err != nil {
-						s.logger.Error("failed to process message", err, logFields)
-						return
-					}
 				}
-				// this is expected behaviour to run Consume again after it exited
-				// see: https://github.com/ThreeDotsLabs/watermill/issues/210
-				s.logger.Debug("Consume stopped without any error, running consume again", logFields)
+
+				logFields.Add(watermill.LogFields{
+					"kafka_error_code": int(kerr),
+					"kafka_error":      kerr.Title(),
+					"retryable":        kerr.Temporary(),
+				})
+
+				// https://kafka.apache.org/protocol#protocol_error_codes
+				s.logger.Error("failed to fetch message", kerr, logFields)
+
+				return
+
+			}
+			if err := messageHandler.processMessage(ctx, reader, &kafkaMessage, logFields); err != nil {
+				s.logger.Error("failed to process message", err, logFields)
+				return
 			}
 
 		}
 	}()
 
-	return readerClosed, nil
+	return groupClosed, nil
+}
+
+func (s *Subscriber) consumeFromPartitions(
+	ctx context.Context,
+	topic string,
+	output chan *message.Message,
+	logFields watermill.LogFields,
+) (chan struct{}, error) {
+	partitions, err := kafka.LookupPartitions(ctx, "tcp", s.config.Brokers[0], topic)
+	if err != nil {
+		return nil, err
+	}
+
+	partitionConsumersWg := &sync.WaitGroup{}
+
+	for _, partition := range partitions {
+		partitionLogFields := logFields.Add(watermill.LogFields{"kafka_partition": partition.ID})
+
+		// Set Readers topic
+		s.config.OverwriteReaderConfig.Topic = topic
+		s.config.OverwriteReaderConfig.Partition = partition.ID
+
+		// Start with a reader
+		reader := kafka.NewReader(*s.config.OverwriteReaderConfig)
+
+		messageHandler := s.createMessagesHandler(output)
+
+		partitionConsumersWg.Add(1)
+		go s.consumePartition(ctx, reader, messageHandler, partitionConsumersWg, partitionLogFields)
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		partitionConsumersWg.Wait()
+		close(closed)
+	}()
+
+	return closed, nil
+}
+
+func (s *Subscriber) consumePartition(
+	ctx context.Context,
+	reader *kafka.Reader,
+	messageHandler messageHandler,
+	partitionConsumersWg *sync.WaitGroup,
+	logFields watermill.LogFields,
+) {
+	defer func() {
+		if err := reader.Close(); err != nil {
+			s.logger.Error("Cannot close partition consumer", err, logFields)
+		}
+		partitionConsumersWg.Done()
+		s.logger.Debug("consumePartition stopped", logFields)
+
+	}()
+
+	for {
+
+		select {
+		default:
+			kafkaMessage, err := reader.FetchMessage(ctx)
+			if errors.Is(err, context.Canceled) {
+
+				return
+
+			} else if err == io.EOF {
+				// end of input (broker closed connection, etc)
+				s.logger.Error("EOF received, stopping listener", err, logFields)
+
+				return
+
+			} else if err != nil {
+				kerr, ok := err.(kafka.Error)
+				if !ok {
+					// unexpected (for now), bail
+					s.logger.Error("unexpected Kafka error", err, logFields)
+
+					return
+				}
+
+				logFields.Add(watermill.LogFields{
+					"kafka_error_code": int(kerr),
+					"kafka_error":      kerr.Title(),
+					"retryable":        kerr.Temporary(),
+				})
+
+				// https://kafka.apache.org/protocol#protocol_error_codes
+				s.logger.Error("failed to fetch message", kerr, logFields)
+
+				return
+
+			}
+			if err := messageHandler.processMessage(ctx, reader, &kafkaMessage, logFields); err != nil {
+				s.logger.Error("failed to process message", err, logFields)
+				return
+			}
+		case <-s.closing:
+			s.logger.Debug("Subscriber is closing, stopping consumePartition", logFields)
+			return
+
+		case <-ctx.Done():
+			s.logger.Debug("Ctx was cancelled, stopping consumePartition", logFields)
+			return
+		}
+
+	}
 }
 
 func (s *Subscriber) createMessagesHandler(output chan *message.Message) messageHandler {
