@@ -2,13 +2,11 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/Shopify/sarama"
-	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	"github.com/segmentio/kafka-go"
 
@@ -66,6 +64,9 @@ type SubscriberConfig struct {
 	// A transport used to send messages to kafka clusters. Defaults to kafka.DefaultTransport.
 	Dialer *kafka.Dialer
 
+	// A transport used to send messages to kafka clusters. Defaults to kafka.DefaultTransport.
+	Transport *kafka.Transport
+
 	// If true then each sent message will be wrapped with Datadog tracing, provided by dd-trace-go.
 	TracingEnabled bool
 
@@ -86,12 +87,29 @@ type SubscriberConfig struct {
 const NoSleep time.Duration = -1
 
 func (c *SubscriberConfig) setDefaults() {
+	if c.Dialer == nil {
+		c.Dialer = &kafka.Dialer{
+			TLS:       &tls.Config{},
+			DualStack: true,
+		}
+	}
+
+	if c.Transport == nil {
+		c.Transport = &kafka.Transport{
+			TLS: &tls.Config{},
+		}
+	}
+
 	if c.OverwriteReaderConfig == nil {
 		c.OverwriteReaderConfig = &kafka.ReaderConfig{
 			Brokers: c.Brokers,
 			Dialer:  c.Dialer,
 			GroupID: c.ConsumerGroup,
 		}
+	} else {
+		c.OverwriteReaderConfig.Brokers = c.Brokers
+		c.OverwriteReaderConfig.Dialer = c.Dialer
+		c.OverwriteReaderConfig.GroupID = c.ConsumerGroup
 	}
 	if c.NackResendSleep == 0 {
 		c.NackResendSleep = time.Millisecond * 100
@@ -110,26 +128,6 @@ func (c SubscriberConfig) Validate() error {
 	}
 
 	return nil
-}
-
-// DefaultSaramaSubscriberConfig creates default Sarama config used by Watermill.
-//
-// Custom config can be passed to NewSubscriber and NewPublisher.
-//
-//	saramaConfig := DefaultSaramaSubscriberConfig()
-//	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-//
-//	subscriberConfig.OverwriteSaramaConfig = saramaConfig
-//
-//	subscriber, err := NewSubscriber(subscriberConfig, logger)
-//	// ...
-func DefaultSaramaSubscriberConfig() *sarama.Config {
-	config := sarama.NewConfig()
-	config.Version = sarama.V1_0_0_0
-	config.Consumer.Return.Errors = true
-	config.ClientID = "watermill"
-
-	return config
 }
 
 // Subscribe subscribers for messages in Kafka.
@@ -317,11 +315,11 @@ func (s *Subscriber) consumeFromReader(ctx context.Context, reader *kafka.Reader
 						return
 					}
 				}
+				// this is expected behaviour to run Consume again after it exited
+				// see: https://github.com/ThreeDotsLabs/watermill/issues/210
+				s.logger.Debug("Consume stopped without any error, running consume again", logFields)
 			}
 
-			// this is expected behaviour to run Consume again after it exited
-			// see: https://github.com/ThreeDotsLabs/watermill/issues/210
-			s.logger.Debug("Consume stopped without any error, running consume again", logFields)
 		}
 	}()
 
@@ -408,9 +406,12 @@ ResendLoop:
 
 		select {
 		case <-msg.Acked():
-			reader.CommitMessages(ctx, *kafkaMsg)
-			h.logger.Trace("Message Acked", receivedMsgLogFields)
-			break ResendLoop
+			err := reader.CommitMessages(ctx, *kafkaMsg)
+			if err == nil {
+				h.logger.Trace("Message Acked", receivedMsgLogFields)
+				break ResendLoop
+			}
+			h.logger.Error("failed to commit message", err, receivedMsgLogFields)
 		case <-msg.Nacked():
 			h.logger.Trace("Message Nacked", receivedMsgLogFields)
 
@@ -438,17 +439,19 @@ func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
 		return errors.New("s.config.InitializeTopicDetails is empty, cannot SubscribeInitialize")
 	}
 
-	s.config.OverwriteReaderConfig.Dialer.DialFunc
-	if err != nil {
-		return errors.Wrap(err, "cannot create cluster admin")
-	}
-	defer func() {
-		if closeErr := clusterAdmin.Close(); closeErr != nil {
-			err = multierror.Append(err, closeErr)
-		}
-	}()
+	s.config.InitializeTopicDetails.Topic = topic
 
-	if err := clusterAdmin.CreateTopic(topic, s.config.InitializeTopicDetails, false); err != nil && !strings.Contains(err.Error(), "Topic with this name already exists") {
+	client := &kafka.Client{
+		Addr:      kafka.TCP(s.config.Brokers...),
+		Transport: s.config.Transport,
+	}
+
+	req := &kafka.CreateTopicsRequest{
+		Addr:   kafka.TCP(s.config.Brokers...),
+		Topics: []kafka.TopicConfig{*s.config.InitializeTopicDetails},
+	}
+
+	if _, err := client.CreateTopics(context.Background(), req); err != nil {
 		return errors.Wrap(err, "cannot create topic")
 	}
 
@@ -457,33 +460,34 @@ func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
 	return nil
 }
 
-type PartitionOffset map[int32]int64
+type PartitionOffset map[int]int64
 
 func (s *Subscriber) PartitionOffset(topic string) (PartitionOffset, error) {
-	client, err := sarama.NewClient(s.config.Brokers, s.config.OverwriteSaramaConfig)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create new Sarama client")
+	client := &kafka.Client{
+		Addr:      kafka.TCP(s.config.Brokers...),
+		Transport: s.config.Transport,
 	}
 
-	defer func() {
-		if closeErr := client.Close(); closeErr != nil {
-			err = multierror.Append(err, closeErr)
-		}
-	}()
-
-	partitions, err := client.Partitions(topic)
+	partitions, err := kafka.LookupPartitions(context.Background(), "tcp", s.config.Brokers[0], topic)
 	if err != nil {
-		return nil, errors.Wrap(err, "cannot get topic partitions")
+		return nil, err
 	}
 
 	partitionOffset := make(PartitionOffset, len(partitions))
 	for _, partition := range partitions {
-		offset, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
+		req := &kafka.OffsetFetchRequest{
+			Addr:    kafka.TCP(s.config.Brokers...),
+			GroupID: s.config.ConsumerGroup,
+			Topics: map[string][]int{
+				topic: {partition.ID},
+			},
+		}
+		res, err := client.OffsetFetch(context.Background(), req)
 		if err != nil {
 			return nil, err
 		}
 
-		partitionOffset[partition] = offset
+		partitionOffset[partition.ID] = res.Topics[topic][0].CommittedOffset
 	}
 
 	return partitionOffset, nil

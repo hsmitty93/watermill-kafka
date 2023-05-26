@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Shopify/sarama"
+	goKafka "github.com/segmentio/kafka-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -33,11 +33,16 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 	var err error
 	var publisher *kafka.Publisher
 
+	writerConfig := &goKafka.Writer{
+		RequiredAcks: -1,
+	}
+
 	retriesLeft := 5
 	for {
 		publisher, err = kafka.NewPublisher(kafka.PublisherConfig{
-			Brokers:   kafkaBrokers(),
-			Marshaler: marshaler,
+			Brokers:         kafkaBrokers(),
+			Marshaler:       marshaler,
+			OverwriteWriter: writerConfig,
 		}, logger)
 		if err == nil || retriesLeft == 0 {
 			break
@@ -49,14 +54,11 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 	}
 	require.NoError(t, err)
 
-	saramaConfig := kafka.DefaultSaramaSubscriberConfig()
-	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-
-	saramaConfig.Admin.Timeout = time.Second * 30
-	saramaConfig.Producer.RequiredAcks = sarama.WaitForAll
-	saramaConfig.ChannelBufferSize = 10240
-	saramaConfig.Consumer.Group.Heartbeat.Interval = time.Millisecond * 500
-	saramaConfig.Consumer.Group.Rebalance.Timeout = time.Second * 3
+	readerConfig := &goKafka.ReaderConfig{
+		QueueCapacity:     10240,
+		HeartbeatInterval: time.Millisecond * 500,
+		RebalanceTimeout:  time.Second * 3,
+	}
 
 	var subscriber *kafka.Subscriber
 
@@ -66,9 +68,9 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 			kafka.SubscriberConfig{
 				Brokers:               kafkaBrokers(),
 				Unmarshaler:           marshaler,
-				OverwriteSaramaConfig: saramaConfig,
+				OverwriteReaderConfig: readerConfig,
 				ConsumerGroup:         consumerGroup,
-				InitializeTopicDetails: &sarama.TopicDetail{
+				InitializeTopicDetails: &goKafka.TopicConfig{
 					NumPartitions:     8,
 					ReplicationFactor: 1,
 				},
